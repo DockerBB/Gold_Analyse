@@ -243,8 +243,6 @@ class GoldPriceApp:
                 change_percent_str = data['涨跌幅'].replace('%', '')
                 yeserday_price = float(data['昨收'])
                 # 处理涨跌值
-                print(yeserday_price)
-
                 if current_price - yeserday_price > 0:
                     up_down = 1
                     change_value = float(change_str)
