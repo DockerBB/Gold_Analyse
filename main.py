@@ -3,19 +3,56 @@ from tkinter import font
 import threading
 import time
 import json
-import websocket
-import ssl
 from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
+
+
+def fetch_gold_price():
+    """抓取现货黄金价格"""
+    url = "https://quote.fx678.com/exchange/wgjs"
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        response.encoding = 'utf-8'
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # 找到现货黄金行
+        gold_row = soup.find('tr', {'id': 'XAU'})
+
+        if gold_row:
+            cells = gold_row.find_all('td')
+
+            data = {
+                '名称': cells[0].text.strip(),
+                '最新价': cells[1].text.strip(),
+                '涨跌': cells[2].find('span').text.strip() if cells[2].find('span') else cells[2].text.strip(),
+                '涨跌幅': cells[3].text.strip(),
+                '最高': cells[4].text.strip(),
+                '最低': cells[5].text.strip(),
+                '昨收': cells[6].text.strip(),
+                '更新时间': cells[7].text.strip()
+            }
+
+            return data
+        else:
+            return None
+
+    except Exception as e:
+        print(f"抓取失败: {e}")
+        return None
 
 
 class GoldPriceApp:
-    def __init__(self, root, open_price=None):
-        self.last_bid_price = None
-        self.previous_bid_price = None
+    def __init__(self, root):
         self.root = root
-
-        # 设置开盘价，如果没有提供则使用默认值
-        self.open_price = open_price
+        self.last_price = None
+        self.previous_price = None
 
         # 移除窗口标题栏和边框
         self.root.overrideredirect(True)
@@ -37,29 +74,14 @@ class GoldPriceApp:
             except:
                 self.common_font = font.Font(family="Tahoma", size=25, weight="bold")
 
-        # WebSocket相关变量
-        self.ws = None
-        self.ws_thread = None
-        self.is_connected = False
-        self.reconnect_interval = 15  # 重连间隔
-        self.max_reconnect_attempts = 3  # 最大重连次数
-        self.reconnect_attempts = 0  # 当前重连次数
-        self.connection_active = False  # 连接活跃状态
-        self.should_reconnect = True  # 是否应该重连
-
-        # AllTick API配置
-        self.token = "2529a14f7a370b0704cf1008ea8ce271-c-app"  # 请替换为你的实际token
-        self.symbol = "XAUUSD"  # 黄金/美元代码
-        self.ws_url = f"wss://quote.alltick.co/quote-b-ws-api?token={self.token}"  # 外汇贵金属API地址
-
         # 创建界面
         self.create_widgets()
 
         # 绑定拖动事件
         self.bind_drag_events()
 
-        # 启动WebSocket连接
-        self.connect_websocket()
+        # 启动数据更新线程
+        self.start_update_thread()
 
         # 初始位置居中
         self.center_window()
@@ -98,11 +120,13 @@ class GoldPriceApp:
         y = self.root.winfo_y() + deltay
         self.root.geometry(f"+{x}+{y}")
 
+    def manual_refresh(self, event):
+        """手动刷新数据"""
+        self.status_var.set("手动刷新中...")
+        self.update_gold_data()
+
     def quit_app(self, event):
-        """双击退出程序"""
-        self.should_reconnect = False  # 停止重连
-        if self.ws:
-            self.ws.close()
+        """退出程序"""
         self.root.quit()
 
     def create_widgets(self):
@@ -192,177 +216,60 @@ class GoldPriceApp:
         # 居中显示
         content_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
-    def connect_websocket(self):
-        """连接AllTick WebSocket API"""
-        # 确保只有一个连接
-        if self.ws_thread and self.ws_thread.is_alive():
-            print("已有活跃的WebSocket连接，跳过新连接")
-            return
+    def start_update_thread(self):
+        """启动数据更新线程"""
+        update_thread = threading.Thread(target=self.update_loop, daemon=True)
+        update_thread.start()
 
-        self.ws_thread = threading.Thread(target=self._websocket_thread, daemon=True)
-        self.ws_thread.start()
+    def update_loop(self):
+        """循环更新数据"""
+        # 首次更新
+        self.update_gold_data()
 
-    def _websocket_thread(self):
-        """WebSocket线程 - 基于官方示例重构"""
+        # 然后每秒更新一次
+        while True:
+            time.sleep(1)
+            self.update_gold_data()
 
-        def on_open(ws):
-            """WebSocket连接打开时发送订阅请求"""
-            print("WebSocket连接已开启")
-            self.root.after(0, lambda: self.status_var.set("已连接"))
-            self.is_connected = True
-            self.connection_active = True
+    def update_gold_data(self):
+        """获取并更新黄金数据"""
+        data = fetch_gold_price()
 
-            # 发送订阅请求 - 使用官方示例格式
-            sub_param = {
-                "cmd_id": 22002,
-                "seq_id": 123,
-                "trace": "3baaa938-f92c-4a74-a228-fd49d5e2f8bc-1678419657806",
-                "data": {
-                    "symbol_list": [
-                        {
-                            "code": self.symbol,
-                            "depth_level": 1,  # 只订阅第一档深度
-                        }
-                    ]
-                }
-            }
-
-            sub_str = json.dumps(sub_param)
-            ws.send(sub_str)
-            print(f"已订阅{self.symbol}深度行情")
-
-            # 启动心跳线程
-            threading.Thread(target=self.thread_heartbeat, args=(ws,), daemon=True).start()
-
-        def on_message(ws, message):
-            """处理接收到的WebSocket消息"""
+        if data:
             try:
-                # 使用json.loads而不是eval，更安全
-                data = json.loads(message)
-                print(f"收到消息: {data}")  # 调试信息
+                # 提取价格信息
+                current_price = float(data['最新价'].replace(',', ''))
+                change_str = data['涨跌']
+                change_percent_str = data['涨跌幅'].replace('%', '')
 
-                # 立即处理数据并更新显示
-                self.process_and_update_data(data)
+                # 处理涨跌值
+                if change_str.startswith('+'):
+                    up_down = 1
+                    change_value = float(change_str[1:])
+                elif change_str.startswith('-'):
+                    up_down = -1
+                    change_value = float(change_str[1:])
+                else:
+                    up_down = 0
+                    change_value = 0
 
-                # 重置重连计数
-                self.reconnect_attempts = 0
-                # 标记连接为活跃
-                self.connection_active = True
-            except Exception as e:
-                print(f"解析WebSocket数据错误: {e}")
-                self.root.after(0, lambda: self.status_var.set(f"数据错误: {str(e)}"))
-
-        def on_error(ws, error):
-            """处理WebSocket错误"""
-            print(f"WebSocket错误: {error}")
-            self.root.after(0, lambda: self.status_var.set(f"连接错误: {str(error)}"))
-            self.is_connected = False
-            self.connection_active = False
-
-        def on_close(ws, close_status_code, close_msg):
-            """处理WebSocket连接关闭"""
-            print(f"WebSocket连接关闭: {close_status_code} - {close_msg}")
-            self.root.after(0, lambda: self.status_var.set("连接已断开"))
-            self.is_connected = False
-            self.connection_active = False
-
-            # 只有在应该重连且未达到最大重连次数时才尝试重连
-            if self.should_reconnect and self.reconnect_attempts < self.max_reconnect_attempts:
-                self.reconnect_attempts += 1
-                wait_time = self.reconnect_interval * self.reconnect_attempts  # 递增等待时间
-                print(f"尝试重新连接 ({self.reconnect_attempts}/{self.max_reconnect_attempts})，等待 {wait_time} 秒...")
-                self.root.after(0, lambda: self.status_var.set(
-                    f"重新连接中 ({self.reconnect_attempts}/{self.max_reconnect_attempts})"))
-                time.sleep(wait_time)
-                self.connect_websocket()
-            else:
-                print("达到最大重连次数，停止尝试")
-                self.root.after(0, lambda: self.status_var.set("连接失败，请检查网络和token"))
-
-        # 创建WebSocket连接 - 使用官方示例方式
-        try:
-            self.ws = websocket.WebSocketApp(
-                self.ws_url,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-
-            # 运行WebSocket
-            self.ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
-        except Exception as e:
-            print(f"WebSocket连接异常: {e}")
-            self.root.after(0, lambda: self.status_var.set(f"连接异常: {str(e)}"))
-            self.connection_active = False
-
-    def thread_heartbeat(self, ws):
-        """心跳线程 - 基于官方示例"""
-        while self.is_connected and self.should_reconnect:
-            time.sleep(10)  # 每10秒发送一次心跳
-            if ws.sock and ws.sock.connected:
-                heartbeat = {
-                    "cmd_id": 22000,
-                    "seq_id": 123,
-                    "trace": "heartbeat-trace",
-                    "data": {}
-                }
+                # 处理涨跌幅
                 try:
-                    ws.send(json.dumps(heartbeat))
-                    print("已发送心跳")
-                except Exception as e:
-                    print(f"发送心跳失败: {e}")
-                    break
+                    change_percent = float(change_percent_str)
+                except:
+                    change_percent = 0
 
-    def process_and_update_data(self, data):
-        """处理接收到的数据并立即更新显示"""
-        try:
-            # 检查是否是深度数据 (cmd_id: 22999)
-            if data.get('cmd_id') != 22999:
-                return  # 忽略其他类型的数据
 
-            depth_data = data.get('data', {})
-            code = depth_data.get('code')
+                # 在主线程中更新显示
+                self.root.after(0, self.update_display, current_price, up_down, change_percent, data['更新时间'])
 
-            # 确认是我们订阅的品种
-            if code != self.symbol:
-                return
+            except Exception as e:
+                print(f"数据处理错误: {e}")
+                self.root.after(0, self.update_display, None, 0, 0, "")
+        else:
+            self.root.after(0, self.update_display, None, 0, 0, "")
 
-            # 获取买盘数据
-            bids = depth_data.get('bids', [])
-
-            if not bids:
-                print("买盘数据不完整")
-                return
-
-            # 获取最优买价
-            current_price = float(bids[0].get('price', 0))
-
-            # 保存当前价格到历史记录
-            self.previous_bid_price = self.last_bid_price
-            self.last_bid_price = current_price
-
-            # 计算涨跌额和涨跌幅（相对于开盘价）
-            up_down = 0
-            change_percent = 0
-
-            # 如果有开盘价，则与开盘价比较
-            if self.open_price is not None and self.open_price != 0:
-                up_down = current_price - self.open_price
-                change_percent = (up_down / self.open_price) * 100
-            # 如果没有开盘价，则与前一个价格比较
-            elif self.previous_bid_price is not None and self.previous_bid_price != 0:
-                up_down = current_price - self.previous_bid_price
-                change_percent = (up_down / self.previous_bid_price) * 100
-
-            # 更新显示
-            self.root.after(0, lambda: self.update_display(current_price, up_down, change_percent))
-
-        except Exception as e:
-            print(f"处理买盘数据时出错: {e}")
-            self.root.after(0, lambda: self.status_var.set(f"处理错误: {str(e)}"))
-
-    def update_display(self, price, up_down, change_percent):
+    def update_display(self, price, up_down, change_percent, update_time=""):
         """更新界面显示"""
         if price is None:
             # 显示错误状态
@@ -379,6 +286,9 @@ class GoldPriceApp:
             self.arrow_shadow_label.configure(fg=error_shadow)
             self.change_label.configure(fg=error_color)
             self.change_shadow_label.configure(fg=error_shadow)
+
+            # 更新状态
+            self.status_var.set("数据获取失败")
             return
 
         # 更新价格
@@ -413,30 +323,14 @@ class GoldPriceApp:
 
         # 更新状态为最新时间
         current_time = datetime.now().strftime("%H:%M:%S")
-        # 如果有开盘价，在状态栏显示开盘价
-        if self.open_price is not None:
-            self.status_var.set(f"开盘价: {self.open_price:.2f} | 更新于 {current_time}")
-        else:
-            self.status_var.set(f"更新于 {current_time}")
 
-    def manual_refresh(self, event=None):
-        """手动刷新价格 - 重新连接WebSocket"""
-        self.root.after(0, lambda: self.status_var.set("重新连接中..."))
-        if self.ws:
-            self.ws.close()
-        self.connect_websocket()
+
+
+        self.status_var.set(f"更新于 {update_time or current_time}")
 
 
 def main():
     root = tk.Tk()
-
-    # 设置开盘价 - 这里可以修改为您需要的开盘价
-    # 例如：假设开盘价是 2350.00
-    open_price = 4227.00
-
-    # 将开盘价传递给应用
-    app = GoldPriceApp(root, open_price=open_price)
-
     # 在Windows系统上尝试启用ClearType字体渲染
     try:
         from ctypes import windll
@@ -444,6 +338,7 @@ def main():
     except:
         pass
 
+    app = GoldPriceApp(root)
     root.mainloop()
 
 
